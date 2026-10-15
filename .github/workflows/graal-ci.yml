@@ -1,0 +1,90 @@
+name: CI Build in GraalVM native-image with tests
+
+on:
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow_ref }}-${{ github.event.pull_request.number || 
+    github.ref }}
+  cancel-in-progress: true
+
+# The test reporter publishes a check run. A pull_request build from a fork gets a
+# read-only token regardless, and falls back to annotations there.
+permissions:
+  contents: read
+  checks: write
+
+jobs:
+  native-build:
+    runs-on: ${{ matrix.runner }}
+    name: GraalVM ${{ matrix.graalvm-version }} ${{ matrix.distribution }} 
+      native build [${{ matrix.expander_leg }}]
+    strategy:
+      fail-fast: false
+      # Spelled out rather than a cross product, because the cells are not
+      # interchangeable: only the interim releases can run exact reachability
+      # metadata, so that will be enabled per cell rather than globally.
+      matrix:
+        include:
+        - os: macos-latest
+          arch: arm64
+          runner: macos-latest
+          graalvm-version: '25.0'
+          distribution: 'graalvm'
+          expander_leg: macos-latest--arm64
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        fetch-tags: true
+        fetch-depth: 0
+
+    - uses: graalvm/setup-graalvm@v1
+      name: setup build jdk
+      id: build_jdk
+      with:
+        version: ${{ matrix.graalvm-version }}
+        distribution: ${{ matrix.distribution }}
+        cache: maven
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: build code
+      id: install
+      env:
+        MAVEN_ARGS: "-B -ff -Djdbi.native=true"
+      run: |
+        ./mvnw --version
+        make install
+
+    - uses: ./.github/actions/test-report
+      name: report native test failures
+      if: ${{ !cancelled() }}
+      with:
+        name: 'native test report (${{ matrix.graalvm-version }}, ${{ matrix.distribution
+          }})'
+
+    - uses: actions/upload-artifact@v7
+      name: upload build logs
+      id: upload_build_logs
+      continue-on-error: true
+      if: ${{ always() }}
+      with:
+        name: build logs (${{ github.job }}, ${{ matrix.graalvm-version }}, ${{ 
+          matrix.distribution }})
+        retention-days: 90
+        path: |
+          **/target
+          !**/target/**/*.jar
+          !**/target/**/*.class
+
+    - uses: actions/upload-artifact@v7
+      name: upload build artifacts
+      id: upload_build_artifacts
+      continue-on-error: true
+      with:
+        name: build artifacts (${{ github.job }}, ${{ matrix.graalvm-version }},
+          ${{ matrix.distribution }})
+        retention-days: 1
+        path: |
+          **/target/native-tests
+          **/target/native-test-reports/*
+
+    timeout-minutes: 150
