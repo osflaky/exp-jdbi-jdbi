@@ -1,0 +1,190 @@
+/*
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.jdbi.v3.core.result.internal;
+
+import java.lang.reflect.Type;
+import java.sql.ResultSet;
+import java.sql.ResultSetMetaData;
+import java.sql.SQLException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
+
+import org.jdbi.v3.core.internal.PrefixedMapperKey;
+import org.jdbi.v3.core.mapper.ColumnMapper;
+import org.jdbi.v3.core.mapper.MappingException;
+import org.jdbi.v3.core.mapper.NoSuchMapperException;
+import org.jdbi.v3.core.mapper.RowMapper;
+import org.jdbi.v3.core.mapper.RowMappers;
+import org.jdbi.v3.core.qualifier.QualifiedType;
+import org.jdbi.v3.core.result.RowView;
+import org.jdbi.v3.core.statement.StatementContext;
+
+public class RowViewImpl extends RowView {
+    private final StatementContext ctx;
+    private final ResultSet rs;
+
+    private final Map<Type, RowMapper<?>> rowMappers = new ConcurrentHashMap<>();
+    private final Map<PrefixedMapperKey, RowMapper<?>> prefixedRowMappers = new ConcurrentHashMap<>();
+    private final Map<QualifiedType<?>, ColumnMapper<?>> columnMappers = new ConcurrentHashMap<>();
+    private final Map<RowMapper<?>, RowMapper<?>> specializedMappers = new ConcurrentHashMap<>();
+
+    public RowViewImpl(ResultSet rs, StatementContext ctx) {
+        this.rs = rs;
+        this.ctx = ctx;
+    }
+
+    /**
+     * Use a row mapper to extract a type from the current ResultSet row.
+     * @param type the type to map
+     * @return the materialized object
+     */
+    @Override
+    public Object getRow(Type type) {
+        try {
+            return rowMapperFor(type).map(rs, ctx);
+        } catch (SQLException e) {
+            throw new MappingException(e);
+        }
+    }
+
+    @Override
+    public Object getRow(Type type, String prefix) {
+        Objects.requireNonNull(prefix, "prefix; use getRow(type) to map without a prefix");
+        try {
+            return prefixedRowMapperFor(type, prefix).map(rs, ctx);
+        } catch (SQLException e) {
+            throw new MappingException(e);
+        }
+    }
+
+    private RowMapper<?> rowMapperFor(Type type) throws SQLException {
+        if (rowMappers.containsKey(type)) {
+            return rowMappers.get(type);
+        }
+
+        RowMapper<?> mapper = ctx.findRowMapperFor(type)
+                .orElseThrow(() -> new NoSuchMapperException("No row mapper registered for " + type))
+                .specialize(rs, ctx);
+        rowMappers.put(type, mapper);
+
+        return mapper;
+    }
+
+    private RowMapper<?> prefixedRowMapperFor(Type type, String prefix) throws SQLException {
+        var key = new PrefixedMapperKey(type, prefix);
+        RowMapper<?> cached = prefixedRowMappers.get(key);
+        if (cached != null) {
+            return cached;
+        }
+
+        RowMapper<?> mapper = ctx.getConfig(RowMappers.class).findFor(type, prefix)
+                .orElseThrow(() -> new NoSuchMapperException(
+                        "No row mapper registered for " + type + " with prefix \"" + prefix + "\""))
+                .specialize(rs, ctx);
+        prefixedRowMappers.put(key, mapper);
+
+        return mapper;
+    }
+
+    @Override
+    public List<String> getColumnNames() {
+        try {
+            ResultSetMetaData metaData = rs.getMetaData();
+            List<String> names = new ArrayList<>(metaData.getColumnCount());
+            for (int i = 1; i <= metaData.getColumnCount(); i++) {
+                names.add(metaData.getColumnLabel(i));
+            }
+            return Collections.unmodifiableList(names);
+        } catch (SQLException e) {
+            throw new MappingException(e);
+        }
+    }
+
+    @Override
+    @SuppressWarnings("unchecked")
+    public <T> T getRow(RowMapper<T> mapper) {
+        try {
+            RowMapper<?> specialized = specializedMappers.get(mapper);
+            if (specialized == null) {
+                specialized = mapper.specialize(rs, ctx);
+                specializedMappers.put(mapper, specialized);
+            }
+            return (T) specialized.map(rs, ctx);
+        } catch (SQLException e) {
+            throw new MappingException(e);
+        }
+    }
+
+    @Override
+    public Object getColumn(String column) {
+        try {
+            return rs.getObject(column);
+        } catch (SQLException e) {
+            throw new MappingException(e);
+        }
+    }
+
+    @Override
+    public Object getColumn(int column) {
+        try {
+            return rs.getObject(column);
+        } catch (SQLException e) {
+            throw new MappingException(e);
+        }
+    }
+
+    /**
+     * Use a qualified column mapper to extract a type from the current ResultSet row.
+     * @param <T> the type to map
+     * @param column the column index
+     * @param type the QualifiedType of the type
+     * @return the materialized T
+     */
+    @Override
+    @SuppressWarnings("unchecked")
+    public <T> T getColumn(int column, QualifiedType<T> type) {
+        try {
+            return (T) columnMapperFor(type).map(rs, column, ctx);
+        } catch (SQLException e) {
+            throw new MappingException(e);
+        }
+    }
+
+    /**
+     * Use a qualified column mapper to extract a type from the current ResultSet row.
+     * @param <T> the type to map
+     * @param column the column name
+     * @param type the QualifiedType of the type
+     * @return the materialized T
+     */
+    @Override
+    @SuppressWarnings("unchecked")
+    public <T> T getColumn(String column, QualifiedType<T> type) {
+        try {
+            return (T) columnMapperFor(type).map(rs, column, ctx);
+        } catch (SQLException e) {
+            throw new MappingException(e);
+        }
+    }
+
+    private ColumnMapper<?> columnMapperFor(QualifiedType<?> type) {
+        return columnMappers.computeIfAbsent(type, t ->
+                ctx.findColumnMapperFor(t)
+                        .orElseThrow(() -> new NoSuchMapperException("No column mapper registered for " + t)));
+    }
+}

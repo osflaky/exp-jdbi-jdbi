@@ -1,0 +1,6 @@
+{
+  "reflection": [
+    {"type":{"proxy":["org.jdbi.v3.freemarker.BindBeanListTest$SomethingByArray"]}},
+    {"type":"org.jdbi.v3.generator.NonpublicSubclassTest$GeneratorConfig","methods":[{"name":"<init>"}],"fields":[{"name":"configuredType"},{"name":"configuredMethod"}]}
+  ]
+}

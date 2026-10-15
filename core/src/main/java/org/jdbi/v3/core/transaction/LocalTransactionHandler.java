@@ -1,0 +1,341 @@
+/*
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.jdbi.v3.core.transaction;
+
+import java.sql.Connection;
+import java.sql.SQLException;
+import java.sql.Savepoint;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.WeakHashMap;
+
+import org.jdbi.v3.core.Handle;
+import org.jdbi.v3.core.HandleCallback;
+import org.jdbi.v3.core.internal.exceptions.Unchecked;
+
+/**
+ * This <code>TransactionHandler</code> uses local JDBC transactions
+ * demarcated explicitly on the handle and passed through to be handled
+ * directly on the JDBC Connection instance.
+ * <p>
+ * A connection that arrives with autocommit disabled is treated as enrolled
+ * in a transaction that the connection owner manages. The handle reports an
+ * open transaction, {@code inTransaction} and {@code useTransaction} join
+ * that transaction without a commit, {@code begin} does nothing, and explicit
+ * {@code commit} and {@code rollback} operate on the open transaction and can
+ * repeat. Closing such a handle does not commit, roll back, or throw. See the
+ * "Transactions managed outside Jdbi" section of the User Guide.
+ * </p>
+ * <p>
+ * Use {@link #managed()} for a handler that manages transactions itself on
+ * connections with autocommit disabled instead of joining them.
+ * </p>
+ */
+public class LocalTransactionHandler implements TransactionHandler {
+    private final Map<Handle, BoundLocalTransactionHandler> bound = Collections.synchronizedMap(new WeakHashMap<>());
+
+    final boolean managed;
+
+    public LocalTransactionHandler() {
+        this(false);
+    }
+
+    private LocalTransactionHandler(boolean managed) {
+        this.managed = managed;
+    }
+
+    @Override
+    public void begin(Handle handle) {
+        nonspecial(handle).begin(handle);
+    }
+
+    @Override
+    public void commit(Handle handle) {
+        nonspecial(handle).commit(handle);
+    }
+
+    @Override
+    public void rollback(Handle handle) {
+        nonspecial(handle).rollback(handle);
+    }
+
+    @Override
+    public boolean isInTransaction(Handle handle) {
+        return nonspecial(handle).isInTransaction(handle);
+    }
+
+    @Override
+    public void savepoint(Handle handle, String savepointName) {
+        nonspecial(handle).savepoint(handle, savepointName);
+    }
+
+    @Override
+    public void rollbackToSavepoint(Handle handle, String savepointName) {
+        nonspecial(handle).rollbackToSavepoint(handle, savepointName);
+    }
+
+    @Override
+    public void releaseSavepoint(Handle handle, String savepointName) {
+        nonspecial(handle).releaseSavepoint(handle, savepointName);
+    }
+
+    @Override
+    public <R, X extends Exception> R inTransaction(Handle handle, HandleCallback<R, X> callback) throws X {
+        return nonspecial(handle).inTransaction(handle, callback);
+    }
+
+    @Override
+    public <R, X extends Exception> R inTransaction(Handle handle, TransactionIsolationLevel level, HandleCallback<R, X> callback) throws X {
+        return nonspecial(handle).inTransaction(handle, level, callback);
+    }
+
+    TransactionHandler nonspecial(Handle handle) {
+        return bound.computeIfAbsent(handle, Unchecked.function(h -> new BoundLocalTransactionHandler(h, managed)));
+    }
+
+    public static LocalTransactionHandler binding() {
+        return new BindingLocalTransactionHandler(false);
+    }
+
+    /**
+     * Returns a handler that manages transactions itself on every connection,
+     * including a connection with autocommit disabled. The handler does not read
+     * the autocommit flag to find the transaction state. It tracks the
+     * transactions that Jdbi demarcates: {@code inTransaction} and
+     * {@code useTransaction} start a transaction, run the callback, and commit,
+     * and {@code isInTransaction} returns true only between {@code begin} and
+     * the commit or rollback. A statement executed outside of a transaction is
+     * not committed, and {@code commit} or {@code rollback} outside of a
+     * transaction does not touch the connection.
+     * <p>
+     * Use this handler when a connection pool disables autocommit as a
+     * precaution and Jdbi manages the transactions, for example
+     * {@code jdbi.setTransactionHandler(LocalTransactionHandler.managed())}.
+     * </p>
+     *
+     * @return a transaction handler that manages transactions on connections with autocommit disabled.
+     */
+    public static LocalTransactionHandler managed() {
+        return new BindingLocalTransactionHandler(true);
+    }
+
+    public void reset(Handle handle) {
+        bound.remove(handle);
+    }
+
+    static class BindingLocalTransactionHandler extends LocalTransactionHandler {
+        BindingLocalTransactionHandler(boolean managed) {
+            super(managed);
+        }
+
+        @Override
+        public TransactionHandler specialize(Handle handle) throws SQLException {
+            return new BoundLocalTransactionHandler(handle, managed);
+        }
+    }
+
+    static class BoundLocalTransactionHandler implements TransactionHandler {
+        enum State {
+            /** The handler is either before "begin" or after "commit/rollback". Autocommit may be enabled. */
+            OUTSIDE_TRANSACTION,
+            /** "begin" has been called but the transaction is not yet started. Autocommit is turned off. */
+            AFTER_BEGIN,
+            /** transaction has been started. next operation must be either commit or rollback. */
+            IN_TRANSACTION
+        }
+
+        private final Map<String, Savepoint> savepoints = new HashMap<>();
+        private final boolean managed;
+        private boolean initialAutocommit;
+        private State handlerState;
+
+        BoundLocalTransactionHandler(Handle handle, boolean managed) throws SQLException {
+            this.managed = managed;
+            this.initialAutocommit = handle.getConnection().getAutoCommit();
+            this.handlerState = getInitialHandlerState();
+        }
+
+        @Override
+        public void begin(Handle handle) {
+            try {
+                if (handlerState == State.OUTSIDE_TRANSACTION) {
+                    Connection conn = handle.getConnection();
+                    initialAutocommit = conn.getAutoCommit();
+                    savepoints.clear();
+                    conn.setAutoCommit(false);
+                    // a managed handler cannot use the autocommit flag to detect an explicit
+                    // begin, so begin promotes the state machine instead
+                    handlerState = managed ? State.IN_TRANSACTION : State.AFTER_BEGIN;
+                }
+            } catch (SQLException e) {
+                throw new TransactionException("Failed to start transaction", e);
+            }
+        }
+
+        @Override
+        public void commit(Handle handle) {
+            try {
+                if (handlerState != State.OUTSIDE_TRANSACTION) {
+                    handle.getConnection().commit();
+                }
+                handlerState = getInitialHandlerState();
+                restoreAutoCommitState(handle);
+            } catch (SQLException e) {
+                try {
+                    handle.rollback();
+                } catch (Exception rollbackException) {
+                    e.addSuppressed(rollbackException);
+                }
+
+                throw new TransactionException("Failed to commit transaction", e);
+            }
+        }
+
+        @Override
+        public void rollback(Handle handle) {
+            try {
+                if (handlerState != State.OUTSIDE_TRANSACTION) {
+                    handle.getConnection().rollback();
+                }
+            } catch (SQLException e) {
+                throw new TransactionException("Failed to rollback transaction", e);
+            } finally {
+                handlerState = getInitialHandlerState();
+                restoreAutoCommitState(handle);
+            }
+        }
+
+        @Override
+        public void savepoint(Handle handle, String name) {
+            final Connection conn = handle.getConnection();
+            try {
+                final Savepoint savepoint = conn.setSavepoint(name);
+                savepoints.put(name, savepoint);
+            } catch (SQLException e) {
+                throw new TransactionException(String.format("Unable to create savepoint '%s'", name), e);
+            }
+        }
+
+        @Override
+        public void releaseSavepoint(Handle handle, String name) {
+            final Connection conn = handle.getConnection();
+            try {
+                final Savepoint savepoint = savepoints.remove(name);
+                if (savepoint == null) {
+                    throw new TransactionException(String.format("Attempt to release non-existent savepoint, '%s'",
+                                                                 name));
+                }
+                conn.releaseSavepoint(savepoint);
+            } catch (SQLException e) {
+                throw new TransactionException(String.format("Unable to create savepoint %s", name), e);
+            }
+        }
+
+        @Override
+        public void rollbackToSavepoint(Handle handle, String name) {
+            final Connection conn = handle.getConnection();
+            try {
+                final Savepoint savepoint = savepoints.remove(name);
+                if (savepoint == null) {
+                    throw new TransactionException(String.format("Attempt to rollback to non-existent savepoint, '%s'",
+                                                                 name));
+                }
+                conn.rollback(savepoint);
+            } catch (SQLException e) {
+                throw new TransactionException(String.format("Unable to create savepoint %s", name), e);
+            }
+        }
+
+        @Override
+        public boolean isInTransaction(Handle handle) {
+            if (managed) {
+                return handlerState == State.IN_TRANSACTION;
+            }
+            try {
+                return handlerState == State.IN_TRANSACTION || !handle.getConnection().getAutoCommit();
+            } catch (SQLException e) {
+                throw new TransactionException("Failed to test for transaction status", e);
+            }
+        }
+
+        @Override
+        public <R, X extends Exception> R inTransaction(Handle handle,
+                                                        HandleCallback<R, X> callback) throws X {
+            if (isInTransaction(handle)) {
+                throw new IllegalStateException("Already in transaction");
+            }
+            final R returnValue;
+
+            try {
+                handle.begin();
+                handlerState = State.IN_TRANSACTION;
+
+                returnValue = callback.withHandle(handle);
+
+                if (handlerState == State.IN_TRANSACTION) {
+                    handle.commit();
+                }
+
+                return returnValue;
+
+            } catch (Throwable e) {
+                // something went wrong within the operation. If this
+                // can still be rolled back, roll it back and handle any
+                // additional exception we may encounter
+                if (handlerState == State.IN_TRANSACTION) {
+                    try {
+                        handle.rollback();
+                    } catch (Exception rollback) {
+                        e.addSuppressed(rollback);
+                    }
+                }
+                // now call mark the operation as failed.
+                throw e;
+            }
+        }
+
+        @Override
+        public <R, X extends Exception> R inTransaction(Handle handle,
+                                                        TransactionIsolationLevel level,
+                                                        HandleCallback<R, X> callback) throws X {
+            final TransactionIsolationLevel initial = handle.getTransactionIsolationLevel();
+            try {
+                handle.setTransactionIsolationLevel(level);
+                return inTransaction(handle, callback);
+            } finally {
+                handle.setTransactionIsolationLevel(initial);
+            }
+        }
+
+        private void restoreAutoCommitState(Handle handle) {
+            try {
+                handle.getConnection().setAutoCommit(initialAutocommit);
+            } catch (SQLException e) {
+                throw new UnableToRestoreAutoCommitStateException(e);
+            } finally {
+                if (initialAutocommit) {
+                    savepoints.clear();
+                }
+            }
+        }
+
+        private State getInitialHandlerState() {
+            // a managed handler is outside of a transaction until begin, whatever the autocommit
+            // flag says, so that a commit or rollback without a begin does not touch the connection
+            return managed || initialAutocommit ? State.OUTSIDE_TRANSACTION : State.AFTER_BEGIN;
+        }
+
+    }
+}
